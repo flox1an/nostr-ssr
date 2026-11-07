@@ -149,6 +149,7 @@ struct Rendered {
     html: serde_json::Value,
     #[serde(default = "default_status")]
     status: u16,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     data: serde_json::Value,
     #[serde(flatten)]
     rest: serde_json::Value,
@@ -159,9 +160,6 @@ fn default_status() -> u16 {
 }
 
 fn render_data(text: &str, url: &str, plugins: &[Arc<dyn Plugin>]) -> Result<String, String> {
-    if plugins.is_empty() {
-        return Ok(text.to_string());
-    }
     let mut r: Rendered = serde_json::from_str(text).map_err(|e| format!("render output: {e}"))?;
     if r.data.is_object() {
         enrich_data(&mut r.data, url, r.status, plugins);
@@ -359,6 +357,16 @@ globalThis.ssrRender = (json) => {
         assert_eq!(ev["data"]["queries"], json!({}));
         assert_eq!(ev["data"]["fromPlugin"], true);
         assert!(ev["html"].as_str().unwrap().contains("6s3l"));
+    }
+
+    #[tokio::test]
+    async fn a_bundle_without_hydration_data_still_renders_with_plugins_loaded() {
+        let path = bundle("nodata", r#"globalThis.ssrRender = () => JSON.stringify({ html: "<p>x</p>", status: 200, head: {} });"#);
+        let r = Renderer::start_with_plugins(path, 1, Mirror::new(0, None, &[]), vec![std::sync::Arc::new(TestPlugin)]);
+        let out = r.call("ssrRender", json!({ "url": "/" }).to_string()).await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out.text).unwrap();
+        assert_eq!(v["html"], "<p>x</p>");
+        assert!(v.get("data").is_none());
     }
 
     #[tokio::test]

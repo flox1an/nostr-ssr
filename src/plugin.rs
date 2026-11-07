@@ -1,24 +1,11 @@
 use serde_json::Value;
 use std::sync::Arc;
 
-/// A global JS function a plugin exposes to the bundle during a render.
-/// The handler runs on the render worker thread and may block on I/O
-/// (e.g. a tracker announce). It receives the JSON-serialised first
-/// argument and returns a JSON-serialised value.
 pub struct JsFunction {
     pub name: &'static str,
     pub handler: Arc<dyn Fn(&str) -> String + Send + Sync>,
 }
 
-/// Application-side SSR enrichment.
-///
-/// A plugin registers JS functions the bundle calls during a render
-/// (server-side logic, e.g. answering a torrent tracker announce), can
-/// add keys to the hydration `data` after a successful render, and can
-/// serve its own HTTP routes under `/api/<name>/`.
-///
-/// Bundle keys always win; plugin keys fill in only where the bundle left
-/// them unset. All domain logic lives in the plugin, not in `nostr-ssr`.
 pub trait Plugin: Send + Sync {
     fn name(&self) -> &'static str;
 
@@ -31,14 +18,11 @@ pub trait Plugin: Send + Sync {
         None
     }
 
-    /// Stateless routes, served under `/api/<name>/`.
     fn routes(&self) -> axum::Router {
         axum::Router::new()
     }
 }
 
-/// Merges `extra` into `target`, creating the object if needed. Any key
-/// the bundle already set is left untouched.
 pub fn merge_into(target: &mut Value, extra: &Value) {
     if let (Value::Object(to), Value::Object(from)) = (target, extra) {
         for (k, v) in from {
@@ -47,7 +31,6 @@ pub fn merge_into(target: &mut Value, extra: &Value) {
     }
 }
 
-/// Runs `enrich` on every plugin and merges each result into `data`.
 pub fn enrich_data(data: &mut Value, url: &str, status: u16, plugins: &[Arc<dyn Plugin>]) {
     for p in plugins {
         if let Some(extra) = p.enrich(url, status, data) {

@@ -13,7 +13,7 @@ use axum::Router;
 use nostr::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::{Arc};
+use std::sync::Arc;
 use std::time::Duration;
 use tower_http::compression::CompressionLayer;
 use tower_http::services::ServeDir;
@@ -383,7 +383,6 @@ globalThis.ssrPaths = () => JSON.stringify(["/about"]);
         let body = String::from_utf8(to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
         assert_eq!(body, r#"{"seeds":7}"#);
         let res = router(app.clone()).oneshot(Request::get("/api/other/x").body(Body::empty()).unwrap()).await.unwrap();
-        // unknown api paths fall through to the SPA shell
         let status = res.status();
         let body = String::from_utf8(to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
         assert_eq!(status, axum::http::StatusCode::OK);
