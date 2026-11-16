@@ -29,6 +29,7 @@ pub struct Tags {
     pub canonical: Option<String>,
     pub json_ld: Option<String>,
     pub author: Option<PublicKey>,
+    pub oembed: Option<String>,
 }
 
 pub struct Profile {
@@ -385,6 +386,9 @@ pub async fn tags_for(state: &State, config: &Config, mirror: &Mirror, path: &st
     };
     let canonical = tags.canonical.get_or_insert_with(|| format!("{}{bare}", origin.trim_end_matches('/'))).clone();
     tags.metas.push(pair("og:url", &canonical));
+    if let Some(o) = &config.oembed {
+        tags.oembed = Some(format!("{}{}?url={}&format=json", origin.trim_end_matches('/'), o.path, crate::media::url_encode(&canonical)));
+    }
     Some(tags)
 }
 
@@ -440,6 +444,9 @@ pub fn merge(head: &str, tags: &Tags) -> String {
     }
     if let Some(c) = &tags.canonical {
         added.push(format!("<link rel=\"canonical\" href=\"{}\" />", escape_html(c)));
+    }
+    if let Some(href) = &tags.oembed {
+        added.push(format!("<link rel=\"alternate\" type=\"application/json+oembed\" href=\"{}\" />", escape_html(href)));
     }
     if let Some(ld) = &tags.json_ld {
         added.push(format!("<script type=\"application/ld+json\">{}</script>", ld.replace("</", "<\\/")));
@@ -620,6 +627,18 @@ mod tests {
         assert_eq!(doc["type"], "link");
         assert_eq!(doc["title"], "dave's Profile");
         assert!(doc.get("html").is_none());
+    }
+
+    #[tokio::test]
+    async fn tagged_pages_link_their_oembed_document() {
+        let m = Mirror::new(0, None, &[]);
+        save(&m, &profile_event(3, r#"{"name":"dave"}"#)).await;
+        let npub = keys(3).public_key().to_bech32().unwrap();
+        let t = tags_for(&State::default(), &oembed_config(player_og()), &m, &format!("/{npub}"), "https://example.com").await.unwrap();
+        let href = format!("https://example.com/oembed?url=https%3A%2F%2Fexample.com%2F{npub}&format=json");
+        assert_eq!(t.oembed.as_deref(), Some(href.as_str()));
+        assert!(merge("", &t).contains(&format!("<link rel=\"alternate\" type=\"application/json+oembed\" href=\"{}\" />", escape_html(&href))));
+        assert!(tags_for(&State::default(), &Config { oembed: None, ..oembed_config(player_og()) }, &m, &format!("/{npub}"), "https://example.com").await.unwrap().oembed.is_none());
     }
 
     #[tokio::test]
