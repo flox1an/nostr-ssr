@@ -246,20 +246,21 @@ fn picture_tags(og: &OpenGraph, ev: &Event, media: &Media, author: Option<&Profi
 
 fn post_tags(og: &OpenGraph, ev: &Event, author: Option<&Profile>) -> Tags {
     let name = author.and_then(|p| p.name.as_deref()).unwrap_or("Nostrich");
-    let heading = format!("{name}: {}", clip(&ev.content, 160));
+    let heading = tag_value(ev, "title").filter(|t| !t.is_empty()).map(str::to_string).unwrap_or_else(|| format!("{name}: {}", clip(&ev.content, 160)));
+    let description = tag_value(ev, "summary").map(|s| clip(s, 200)).unwrap_or_default();
     let image = author.and_then(|p| p.picture.clone()).unwrap_or_else(|| avatar(og, &ev.pubkey));
     let profile_name = author.and_then(|p| p.name.as_deref()).unwrap_or("");
     let published = crate::sitemap::iso(ev.created_at.as_secs() as i64);
     let metas = vec![
         pair("og:type", "article"),
         pair("og:title", &heading),
-        pair("og:description", ""),
+        pair("og:description", &description),
         pair("og:image", &image),
         pair("og:article:published_time", &published),
         pair("og:article:author:username", profile_name),
         pair("twitter:card", "summary"),
         pair("twitter:title", &heading),
-        pair("twitter:description", ""),
+        pair("twitter:description", &description),
         pair("twitter:image", &image),
     ];
     let json_ld = json!({"@context": "https://schema.org", "@type": "Comment", "name": profile_name, "description": ev.content.replace('\n', " "), "datePublished": published, "author": {"@type": "Person", "name": profile_name}}).to_string();
@@ -535,6 +536,16 @@ mod tests {
         assert!(ld["uploadDate"].as_str().unwrap().starts_with("2023-11-14T"));
         assert_eq!(ld["contentUrl"], "https://cdn/v.mp4");
         assert!(ld["embedUrl"].as_str().unwrap().starts_with("https://example.com/embed?v="));
+    }
+
+    #[tokio::test]
+    async fn an_event_with_a_title_tag_uses_it_over_its_content() {
+        let m = Mirror::new(0, None, &[]);
+        let ev = event(1, 30005, "", vec![vec!["d", "list"], vec!["title", "My list"], vec!["summary", "Best clips"]]);
+        let t = event_tags(&OpenGraph::default(), &m, &ev, "https://example.com", None).await;
+        assert_eq!(meta(&t, "og:title"), Some("My list"));
+        assert_eq!(meta(&t, "og:description"), Some("Best clips"));
+        assert_eq!(t.title.as_deref(), Some("My list"));
     }
 
     #[tokio::test]
