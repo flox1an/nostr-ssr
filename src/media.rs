@@ -182,7 +182,7 @@ pub fn parse(ev: &Event) -> Option<Media> {
             }
         }
     }
-    let thumbnail = metas.iter().find_map(|m| m.get("image")).cloned().or_else(|| image.then(|| url.clone()));
+    let thumbnail = metas.iter().find_map(|m| m.get("image")).cloned().or_else(|| image.then(|| url.clone())).or_else(|| tag_value(ev, "thumb").or_else(|| tag_value(ev, "image")).map(str::to_string));
     let primary = metas.iter().find(|m| m.get("url") == Some(&url));
     let explicit_hash = primary.and_then(|m| m.get("x")).cloned();
     let key = if image {
@@ -288,6 +288,16 @@ mod tests {
         let m = parse(&ev).unwrap();
         assert_eq!(m.thumbnail.as_deref(), Some("https://cdn/i.jpg"));
         assert!(m.is_image());
+    }
+
+    #[test]
+    fn a_video_without_an_imeta_image_takes_its_thumb_then_image_tag() {
+        let keys = Keys::generate();
+        let playable = || Tag::parse(["imeta", "url https://cdn/v.mp4", "m video/mp4"]).unwrap();
+        let both = EventBuilder::new(Kind::from(34235), "").tags([playable(), Tag::parse(["d", "a"]).unwrap(), Tag::parse(["image", "https://cdn/i.jpg"]).unwrap(), Tag::parse(["thumb", "https://cdn/t.jpg"]).unwrap()]).finalize(&keys).unwrap();
+        assert_eq!(parse(&both).unwrap().thumbnail.as_deref(), Some("https://cdn/t.jpg"));
+        let image = EventBuilder::new(Kind::from(21), "").tags([playable(), Tag::parse(["image", "https://cdn/i.jpg"]).unwrap()]).finalize(&keys).unwrap();
+        assert_eq!(parse(&image).unwrap().thumbnail.as_deref(), Some("https://cdn/i.jpg"));
     }
 }
 
