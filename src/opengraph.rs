@@ -260,7 +260,7 @@ pub async fn tags_for(state: &State, config: &Config, mirror: &Mirror, path: &st
     let id = last_segment(path)?;
     let bare = path.split(['?', '#']).next().unwrap_or("");
     let entity = is_entity_path(path, &og.entity_prefixes);
-    let address = !entity && is_address_path(path) && !og.skip_paths.iter().chain(config.static_paths.iter()).any(|p| p == bare);
+    let address = og.addresses && !entity && is_address_path(path) && !og.skip_paths.iter().chain(config.static_paths.iter()).any(|p| p == bare);
     if !entity && !address {
         return None;
     }
@@ -523,6 +523,29 @@ mod tests {
         assert!(!entity("/streams") && !entity("/x/npub1abc"));
         assert!(is_address_path("/alice_1") && !is_address_path("/") && !is_address_path("/a/b") && !is_address_path("/a-b"));
         assert_eq!(last_segment("/e/nevent1abc?x=1"), Some("nevent1abc"));
+    }
+
+    #[tokio::test]
+    async fn with_addresses_off_single_segment_paths_get_no_tags_and_no_lookup() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        let pk = keys(4).public_key().to_hex();
+        let app = axum::Router::new().route("/nostr.json", axum::routing::get(move || {
+            let (h, pk) = (h.clone(), pk.clone());
+            async move {
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                axum::Json(json!({"names": {"erin": pk}}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let m = Mirror::new(0, None, &[]);
+        let state = State::default();
+        let og = OpenGraph { nip05_url: Some(format!("http://{addr}/nostr.json?name={{name}}")), nip05_domain: Some("example.com".into()), addresses: false, ..og() };
+        let config = Config { opengraph: Some(og), ..Config::default() };
+        assert!(tags_for(&state, &config, &m, "/erin", "https://example.com").await.is_none());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

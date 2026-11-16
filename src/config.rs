@@ -60,6 +60,7 @@ pub struct OpenGraph {
     pub nip05_domain: Option<String>,
     pub skip_paths: Vec<String>,
     pub entity_prefixes: Vec<String>,
+    pub addresses: bool,
 }
 
 impl Default for OpenGraph {
@@ -73,6 +74,7 @@ impl Default for OpenGraph {
             nip05_domain: None,
             skip_paths: vec![],
             entity_prefixes: vec!["/".into(), "/e/".into(), "/p/".into()],
+            addresses: true,
         }
     }
 }
