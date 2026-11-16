@@ -1,5 +1,6 @@
 use crate::config::{Config, OpenGraph};
 use crate::head::{absolute, escape_html};
+use crate::media::{Media, OLD_SHORTS_KIND, OLD_VIDEO_KIND, SHORTS_KIND, VIDEO_KIND};
 use crate::mirror::{parse_filter, Mirror};
 use nostr::nips::nip19::{Nip19, Nip19Coordinate, Nip19Event};
 use nostr::prelude::*;
@@ -173,6 +174,64 @@ fn clip_tags(og: &OpenGraph, ev: &Event, author: Option<&Profile>) -> Tags {
     Tags { metas, title: Some(heading), canonical: None, json_ld: Some(json_ld) }
 }
 
+fn iso_duration(secs: f64) -> String {
+    let s = secs.round() as u64;
+    match (s / 3600, s % 3600 / 60, s % 60) {
+        (0, m, s) => format!("PT{m}M{s}S"),
+        (h, m, s) => format!("PT{h}H{m}M{s}S"),
+    }
+}
+
+fn video_tags(og: &OpenGraph, ev: &Event, media: &Media, author: Option<&Profile>, player: Option<&str>) -> Tags {
+    let primary = media.metas.iter().find(|m| m.get("url") == Some(&media.url));
+    let mime = primary.and_then(|m| m.get("m"));
+    let dim = primary.and_then(|m| m.get("dim")).and_then(|d| d.split_once('x'));
+    let title = if media.title.is_empty() { clip(&ev.content, 160) } else { media.title.clone() };
+    let description = clip(tag_value(ev, "summary").unwrap_or(&ev.content), 200);
+    let image = media.thumbnail.clone().or_else(|| author.and_then(|p| p.picture.clone())).unwrap_or_else(|| avatar(og, &ev.pubkey));
+    let mut metas = vec![
+        pair("og:type", "video.other"),
+        pair("og:title", &title),
+        pair("og:description", &description),
+        pair("og:image", &image),
+        pair("og:video", &media.url),
+        pair("og:video:secure_url", &media.url),
+    ];
+    if let Some(m) = mime {
+        metas.push(pair("og:video:type", m));
+    }
+    if let Some((w, h)) = dim {
+        metas.push(pair("og:video:width", w));
+        metas.push(pair("og:video:height", h));
+    }
+    metas.extend([
+        pair("twitter:card", if player.is_some() { "player" } else { "summary_large_image" }),
+        pair("twitter:title", &title),
+        pair("twitter:description", &description),
+        pair("twitter:image", &image),
+    ]);
+    if let Some(site) = &og.twitter_site {
+        metas.push(pair("twitter:site", site));
+    }
+    if let Some(player) = player {
+        let (w, h) = dim.unwrap_or(("640", "360"));
+        metas.push(pair("twitter:player", player));
+        metas.push(pair("twitter:player:width", w));
+        metas.push(pair("twitter:player:height", h));
+    }
+    let mut ld = json!({"@context": "https://schema.org", "@type": "VideoObject", "name": title, "description": description, "thumbnailUrl": image, "uploadDate": crate::sitemap::iso(ev.created_at.as_secs() as i64), "contentUrl": media.url});
+    if let Some(d) = media.duration {
+        ld["duration"] = json!(iso_duration(d));
+    }
+    if let Some(p) = player {
+        ld["embedUrl"] = json!(p);
+    }
+    if let Some(name) = author.and_then(|p| p.name.as_deref()) {
+        ld["author"] = json!({"@type": "Person", "name": name});
+    }
+    Tags { metas, title: Some(title), canonical: None, json_ld: Some(ld.to_string()) }
+}
+
 fn post_tags(og: &OpenGraph, ev: &Event, author: Option<&Profile>) -> Tags {
     let name = author.and_then(|p| p.name.as_deref()).unwrap_or("Nostrich");
     let heading = format!("{name}: {}", clip(&ev.content, 160));
@@ -224,6 +283,13 @@ pub async fn event_tags(og: &OpenGraph, mirror: &Mirror, ev: &Event, origin: &st
                 .unwrap_or(ev.pubkey);
             let p = profile(mirror, &host).await;
             live_tags(og, ev, p.as_ref(), &host, player.as_deref())
+        }
+        VIDEO_KIND | SHORTS_KIND | OLD_VIDEO_KIND | OLD_SHORTS_KIND => {
+            let p = profile(mirror, &ev.pubkey).await;
+            match crate::media::parse(ev) {
+                Some(media) => video_tags(og, ev, &media, p.as_ref(), player.as_deref()),
+                None => post_tags(og, ev, p.as_ref()),
+            }
         }
         1313 => {
             let p = profile(mirror, &ev.pubkey).await;
@@ -410,6 +476,62 @@ mod tests {
         assert_eq!(meta(&t, "twitter:card"), Some("summary_large_image"));
         assert!(t.json_ld.as_deref().unwrap().contains("\"Clip\""));
         assert!(t.canonical.as_deref().unwrap().starts_with("https://zap.stream/nevent1"));
+    }
+
+    fn player_og() -> OpenGraph {
+        OpenGraph { player: Some("/embed?v={nip19}".into()), ..OpenGraph::default() }
+    }
+
+    #[tokio::test]
+    async fn a_video_is_tagged_with_its_mp4_size_thumbnail_and_player() {
+        let m = Mirror::new(0, None, &[]);
+        let ev = event(1, 21, "about the trip", vec![vec!["title", "Trip"], vec!["imeta", "url https://cdn/v.mp4", "m video/mp4", "dim 1280x720", "image https://cdn/v.jpg"]]);
+        let t = event_tags(&player_og(), &m, &ev, "https://example.com", None).await;
+        assert_eq!(meta(&t, "og:type"), Some("video.other"));
+        assert_eq!(meta(&t, "og:title"), Some("Trip"));
+        assert_eq!(meta(&t, "og:description"), Some("about the trip"));
+        assert_eq!(meta(&t, "og:image"), Some("https://cdn/v.jpg"));
+        assert_eq!(meta(&t, "og:video"), Some("https://cdn/v.mp4"));
+        assert_eq!(meta(&t, "og:video:type"), Some("video/mp4"));
+        assert_eq!((meta(&t, "og:video:width"), meta(&t, "og:video:height")), (Some("1280"), Some("720")));
+        assert_eq!(meta(&t, "twitter:card"), Some("player"));
+        assert!(meta(&t, "twitter:player").unwrap().starts_with("https://example.com/embed?v=nevent1"));
+        assert_eq!((meta(&t, "twitter:player:width"), meta(&t, "twitter:player:height")), (Some("1280"), Some("720")));
+        assert_eq!(t.title.as_deref(), Some("Trip"));
+    }
+
+    #[tokio::test]
+    async fn an_hls_only_video_is_tagged_as_a_playlist() {
+        let m = Mirror::new(0, None, &[]);
+        let ev = event(1, 22, "", vec![vec!["title", "Short"], vec!["imeta", "url https://cdn/v.m3u8", "m application/x-mpegURL"]]);
+        let t = event_tags(&player_og(), &m, &ev, "https://example.com", None).await;
+        assert_eq!(meta(&t, "og:video"), Some("https://cdn/v.m3u8"));
+        assert_eq!(meta(&t, "og:video:type"), Some("application/x-mpegURL"));
+        assert_eq!((meta(&t, "twitter:player:width"), meta(&t, "twitter:player:height")), (Some("640"), Some("360")));
+    }
+
+    #[tokio::test]
+    async fn video_json_ld_has_an_iso_duration_and_upload_date() {
+        let m = Mirror::new(0, None, &[]);
+        let ev = event(1, 21, "", vec![vec!["title", "Long"], vec!["summary", "A long one"], vec!["imeta", "url https://cdn/v.mp4", "m video/mp4", "duration 3754.4"]]);
+        let t = event_tags(&player_og(), &m, &ev, "https://example.com", None).await;
+        let ld: Value = serde_json::from_str(t.json_ld.as_deref().unwrap()).unwrap();
+        assert_eq!(ld["@type"], "VideoObject");
+        assert_eq!(ld["description"], "A long one");
+        assert_eq!(ld["duration"], "PT1H2M34S");
+        assert!(ld["uploadDate"].as_str().unwrap().starts_with("2023-11-14T"));
+        assert_eq!(ld["contentUrl"], "https://cdn/v.mp4");
+        assert!(ld["embedUrl"].as_str().unwrap().starts_with("https://example.com/embed?v="));
+    }
+
+    #[tokio::test]
+    async fn a_video_without_a_player_gets_a_large_image_card() {
+        let m = Mirror::new(0, None, &[]);
+        let ev = event(1, 21, "", vec![vec!["title", "Trip"], vec!["imeta", "url https://cdn/v.mp4", "m video/mp4"]]);
+        let t = event_tags(&OpenGraph::default(), &m, &ev, "https://example.com", None).await;
+        assert_eq!(meta(&t, "twitter:card"), Some("summary_large_image"));
+        assert_eq!(meta(&t, "twitter:player"), None);
+        assert_eq!(meta(&t, "og:video"), Some("https://cdn/v.mp4"));
     }
 
     #[tokio::test]
