@@ -64,6 +64,14 @@ fn public_ip(ip: IpAddr) -> bool {
     }
 }
 
+pub async fn resolves_public(host: &str, port: u16) -> Option<bool> {
+    let addrs = match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, port))).await {
+        Ok(Ok(addrs)) => addrs.collect::<Vec<_>>(),
+        _ => return None,
+    };
+    Some(!addrs.is_empty() && addrs.iter().all(|a| public_ip(a.ip())))
+}
+
 fn content_type_ok(expect: Expect, content_type: &str) -> bool {
     let ct = content_type.split(';').next().unwrap_or("").trim().to_lowercase();
     match expect {
@@ -113,11 +121,7 @@ impl Health {
                 return Some(*ok);
             }
         }
-        let addrs = match tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host((host, port))).await {
-            Ok(Ok(addrs)) => addrs.collect::<Vec<_>>(),
-            _ => return None,
-        };
-        let ok = !addrs.is_empty() && addrs.iter().all(|a| public_ip(a.ip()));
+        let ok = resolves_public(host, port).await?;
         self.hosts.write().unwrap().insert(host.to_string(), (ok, Instant::now()));
         Some(ok)
     }
@@ -353,5 +357,13 @@ mod tests {
         let c = candidate(&m, &["https://three.example/".into(), "https://two.example".into()]);
         assert_eq!(c.urls.len(), 3);
         assert!(c.urls[2].starts_with("https://three.example/") && c.urls[2].ends_with(".mp4"));
+    }
+
+    #[tokio::test]
+    async fn hosts_resolving_to_private_addresses_are_not_public() {
+        assert_eq!(resolves_public("127.0.0.1", 443).await, Some(false));
+        assert_eq!(resolves_public("localhost", 443).await, Some(false));
+        assert_eq!(resolves_public("10.0.0.1", 443).await, Some(false));
+        assert_eq!(resolves_public("1.1.1.1", 443).await, Some(true));
     }
 }

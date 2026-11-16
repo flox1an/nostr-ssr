@@ -70,6 +70,7 @@ pub struct OpenGraph {
     pub entity_prefixes: Vec<String>,
     pub addresses: bool,
     pub links: Vec<Link>,
+    pub hint_relays: usize,
 }
 
 impl Default for OpenGraph {
@@ -85,6 +86,7 @@ impl Default for OpenGraph {
             entity_prefixes: vec!["/".into(), "/e/".into(), "/p/".into()],
             addresses: true,
             links: vec![],
+            hint_relays: 0,
         }
     }
 }
