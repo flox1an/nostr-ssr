@@ -132,7 +132,7 @@ fn live_tags(og: &OpenGraph, ev: &Event, host_profile: Option<&Profile>, host: &
         pair("og:video", stream),
         pair("og:video:secure_url", stream),
         pair("og:video:type", "application/vnd.apple.mpegurl"),
-        pair("twitter:card", "player"),
+        pair("twitter:card", if player.is_some() { "player" } else { "summary_large_image" }),
         pair("twitter:title", &heading),
         pair("twitter:description", title),
         pair("twitter:image", &image),
@@ -433,6 +433,16 @@ mod tests {
         assert!(event_tags(&o, &m, &live, "https://example.com", None).await.canonical.unwrap().starts_with("https://example.com/live/naddr1"));
         let note = event(1, 1, "hi", vec![]);
         assert!(event_tags(&o, &m, &note, "https://example.com", None).await.canonical.unwrap().starts_with("https://example.com/nevent1"));
+    }
+
+    #[tokio::test]
+    async fn a_stream_without_a_player_gets_a_large_image_card() {
+        let m = Mirror::new(0, None, &[]);
+        let o = OpenGraph { player: None, ..og() };
+        let live = event(1, 30311, "", vec![vec!["d", "room"], vec!["streaming", "https://cdn/l.m3u8"]]);
+        let t = event_tags(&o, &m, &live, "https://example.com", None).await;
+        assert_eq!(meta(&t, "twitter:card"), Some("summary_large_image"));
+        assert_eq!(meta(&t, "twitter:player"), None);
     }
 
     #[tokio::test]
