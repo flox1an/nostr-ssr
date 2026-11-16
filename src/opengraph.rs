@@ -51,9 +51,9 @@ pub fn last_segment(path: &str) -> Option<&str> {
     path.split(['?', '#']).next()?.trim_end_matches('/').rsplit('/').next().filter(|s| !s.is_empty())
 }
 
-pub fn is_entity_path(path: &str) -> bool {
+pub fn is_entity_path(path: &str, prefixes: &[String]) -> bool {
     let path = path.split(['?', '#']).next().unwrap_or("");
-    ENTITY_PREFIXES.iter().any(|p| path.starts_with(&format!("/{p}")) || path.starts_with(&format!("/e/{p}")) || path.starts_with(&format!("/p/{p}")))
+    prefixes.iter().any(|prefix| ENTITY_PREFIXES.iter().any(|p| path.starts_with(&format!("{prefix}{p}"))))
 }
 
 pub fn is_address_path(path: &str) -> bool {
@@ -259,8 +259,9 @@ pub async fn tags_for(state: &State, config: &Config, mirror: &Mirror, path: &st
     let og = config.opengraph.as_ref()?;
     let id = last_segment(path)?;
     let bare = path.split(['?', '#']).next().unwrap_or("");
-    let address = !is_entity_path(path) && is_address_path(path) && !og.skip_paths.iter().chain(config.static_paths.iter()).any(|p| p == bare);
-    if !is_entity_path(path) && !address {
+    let entity = is_entity_path(path, &og.entity_prefixes);
+    let address = !entity && is_address_path(path) && !og.skip_paths.iter().chain(config.static_paths.iter()).any(|p| p == bare);
+    if !entity && !address {
         return None;
     }
     let target = if address {
@@ -516,10 +517,19 @@ mod tests {
 
     #[test]
     fn path_classification_matches_the_old_pages_middleware() {
-        assert!(is_entity_path("/npub1abc") && is_entity_path("/e/nevent1abc") && is_entity_path("/p/nprofile1abc") && is_entity_path("/naddr1abc?x=1"));
-        assert!(!is_entity_path("/streams") && !is_entity_path("/x/npub1abc"));
+        let defaults = OpenGraph::default().entity_prefixes;
+        let entity = |p: &str| is_entity_path(p, &defaults);
+        assert!(entity("/npub1abc") && entity("/e/nevent1abc") && entity("/p/nprofile1abc") && entity("/naddr1abc?x=1"));
+        assert!(!entity("/streams") && !entity("/x/npub1abc"));
         assert!(is_address_path("/alice_1") && !is_address_path("/") && !is_address_path("/a/b") && !is_address_path("/a-b"));
         assert_eq!(last_segment("/e/nevent1abc?x=1"), Some("nevent1abc"));
+    }
+
+    #[test]
+    fn entity_prefixes_replace_the_default_entity_paths() {
+        let prefixes = vec!["/v/".to_string(), "/live/".to_string()];
+        assert!(is_entity_path("/v/nevent1abc", &prefixes) && is_entity_path("/live/naddr1abc?t=1", &prefixes));
+        assert!(!is_entity_path("/naddr1abc", &prefixes) && !is_entity_path("/e/nevent1abc", &prefixes) && !is_entity_path("/v/streams", &prefixes));
     }
 
     #[test]
