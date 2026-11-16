@@ -270,9 +270,9 @@ pub async fn tags_for(state: &State, config: &Config, mirror: &Mirror, path: &st
     } else {
         Nip19::from_bech32(id).ok()?
     };
-    match target {
-        Nip19::Pubkey(pk) => Some(profile_tags(og, &pk, profile(mirror, &pk).await.as_ref())),
-        Nip19::Profile(p) => Some(profile_tags(og, &p.public_key, profile(mirror, &p.public_key).await.as_ref())),
+    let mut tags = match target {
+        Nip19::Pubkey(pk) => profile_tags(og, &pk, profile(mirror, &pk).await.as_ref()),
+        Nip19::Profile(p) => profile_tags(og, &p.public_key, profile(mirror, &p.public_key).await.as_ref()),
         Nip19::EventId(_) | Nip19::Event(_) | Nip19::Coordinate(_) => {
             let (filter, key) = match &target {
                 Nip19::EventId(i) => (json!({"ids": [i.to_hex()]}), i.to_hex()),
@@ -281,10 +281,13 @@ pub async fn tags_for(state: &State, config: &Config, mirror: &Mirror, path: &st
                 _ => return None,
             };
             let ev = lookup(mirror, filter, &format!("og-event:{key}")).await.into_iter().next()?;
-            Some(event_tags(og, mirror, &ev, origin).await)
+            event_tags(og, mirror, &ev, origin).await
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    let canonical = tags.canonical.get_or_insert_with(|| format!("{}{bare}", origin.trim_end_matches('/'))).clone();
+    tags.metas.push(pair("og:url", &canonical));
+    Some(tags)
 }
 
 fn strip(head: &str, pattern: &str) -> String {
@@ -423,6 +426,22 @@ mod tests {
         assert_eq!(meta(&t, "og:description"), Some("hello there"));
         assert_eq!(meta(&t, "og:image"), Some("https://x/d.png"));
         assert!(t.json_ld.as_deref().unwrap().contains("\"Person\""));
+    }
+
+    #[tokio::test]
+    async fn tagged_pages_set_og_url_to_their_canonical_link() {
+        let m = Mirror::new(0, None, &[]);
+        let live = event(1, 30311, "", vec![vec!["d", "room"], vec!["streaming", "https://cdn/l.m3u8"]]);
+        save(&m, &live).await;
+        let state = State::default();
+        let config = Config { opengraph: Some(og()), ..Config::default() };
+        let naddr = Nip19Coordinate::new(live.coordinate().unwrap(), Vec::<RelayUrl>::new()).to_bech32().unwrap();
+        let t = tags_for(&state, &config, &m, &format!("/{naddr}"), "https://example.com").await.unwrap();
+        assert_eq!(meta(&t, "og:url"), t.canonical.as_deref());
+        let npub = keys(3).public_key().to_bech32().unwrap();
+        let t = tags_for(&state, &config, &m, &format!("/p/{npub}?tab=notes"), "https://example.com").await.unwrap();
+        assert_eq!(t.canonical, Some(format!("https://example.com/p/{npub}")));
+        assert_eq!(meta(&t, "og:url"), t.canonical.as_deref());
     }
 
     #[tokio::test]
