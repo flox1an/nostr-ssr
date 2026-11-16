@@ -6,7 +6,8 @@ use nostr::prelude::*;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(3);
@@ -14,12 +15,48 @@ const NIP05_TTL: Duration = Duration::from_secs(24 * 3600);
 const NIP05_NEGATIVE_TTL: Duration = Duration::from_secs(600);
 const NIP05_TIMEOUT: Duration = Duration::from_secs(5);
 const ENTITY_PREFIXES: [&str; 5] = ["npub1", "nprofile1", "naddr1", "nevent1", "note1"];
+const HINT_HOST_INTERVAL: Duration = Duration::from_secs(10);
+const HINT_HOST_FAILURE_PAUSE: Duration = Duration::from_secs(600);
+const HINT_CONCURRENCY: usize = 16;
 
 #[derive(Default)]
 pub struct State {
     nip05: Mutex<HashMap<String, (Instant, Option<PublicKey>)>>,
     client: reqwest::Client,
-    allow_private_hints: bool,
+    hints: Arc<HintLimits>,
+}
+
+#[derive(Default)]
+struct HintLimits {
+    hosts: Mutex<HashMap<String, Instant>>,
+    in_flight: AtomicUsize,
+    allow_private: bool,
+}
+
+fn host_of(url: &RelayUrl) -> String {
+    reqwest::Url::parse(url.as_str()).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default()
+}
+
+impl HintLimits {
+    fn claim(&self, url: &RelayUrl) -> bool {
+        let now = Instant::now();
+        let mut hosts = self.hosts.lock().unwrap();
+        hosts.retain(|_, until| *until > now);
+        let host = host_of(url);
+        if hosts.contains_key(&host) || self.in_flight.load(Ordering::Acquire) >= HINT_CONCURRENCY {
+            return false;
+        }
+        hosts.insert(host, now + HINT_HOST_INTERVAL);
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        true
+    }
+
+    fn release(&self, url: &RelayUrl, failed: bool) {
+        if failed {
+            self.hosts.lock().unwrap().insert(host_of(url), Instant::now() + HINT_HOST_FAILURE_PAUSE);
+        }
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -80,45 +117,49 @@ async fn hint_allowed(url: &RelayUrl, allow_private: bool) -> bool {
         return true;
     }
     match url.host_str() {
-        Some(host) if url.scheme() == "wss" => crate::health::resolves_public(host, url.port_or_known_default().unwrap_or(443)).await == Some(true),
+        Some(host) if url.scheme() == "wss" && url.port_or_known_default() == Some(443) => crate::health::resolves_public(host, 443).await == Some(true),
         _ => false,
     }
 }
 
-async fn fetch_hints(mirror: &Mirror, hints: Vec<RelayUrl>, filter: Filter, allow_private: bool) {
+async fn fetch_hints(mirror: &Mirror, hints: Vec<RelayUrl>, filter: Filter, limits: &Arc<HintLimits>) {
     let mut tasks = tokio::task::JoinSet::new();
     for url in hints {
-        let (database, filter) = (mirror.database.clone(), filter.clone());
+        if !limits.claim(&url) {
+            continue;
+        }
+        let (database, filter, limits) = (mirror.database.clone(), filter.clone(), limits.clone());
         tasks.spawn(async move {
-            if !hint_allowed(&url, allow_private).await {
-                return;
+            let mut fetched = false;
+            if hint_allowed(&url, limits.allow_private).await {
+                let relay = nostr_sdk::relay::Relay::builder(url.clone()).database(database).build();
+                fetched = tokio::time::timeout(FETCH_TIMEOUT, async { relay.try_connect().await.is_ok() && relay.fetch_events(vec![filter]).await.is_ok() }).await.unwrap_or(false);
+                relay.disconnect();
             }
-            let relay = nostr_sdk::relay::Relay::builder(url).database(database).build();
-            let _ = tokio::time::timeout(FETCH_TIMEOUT, async {
-                if relay.try_connect().await.is_ok() {
-                    let _ = relay.fetch_events(vec![filter]).await;
-                }
-            })
-            .await;
-            relay.disconnect();
+            limits.release(&url, !fetched);
         });
     }
     while tasks.join_next().await.is_some() {}
 }
 
-async fn lookup(mirror: &Mirror, filter: Value, key: &str, hints: Vec<RelayUrl>, allow_private: bool) -> Vec<Event> {
+async fn lookup(mirror: &Mirror, filter: Value, key: &str, hints: Vec<RelayUrl>, limits: Option<&Arc<HintLimits>>) -> Vec<Event> {
     let found = mirror.query(std::slice::from_ref(&filter)).await;
     if !found.is_empty() || !mirror.should_try(key) {
         return found;
     }
     if let Some((f, _)) = parse_filter(&filter) {
-        tokio::join!(mirror.fetch(vec![f.clone()], FETCH_TIMEOUT), fetch_hints(mirror, hints, f, allow_private));
+        let hinted = async {
+            if let Some(limits) = limits {
+                fetch_hints(mirror, hints, f.clone(), limits).await;
+            }
+        };
+        tokio::join!(mirror.fetch(vec![f.clone()], FETCH_TIMEOUT), hinted);
     }
     mirror.query(&[filter]).await
 }
 
 async fn profile(mirror: &Mirror, pubkey: &PublicKey) -> Option<Profile> {
-    let ev = lookup(mirror, json!({"kinds": [0], "authors": [pubkey.to_hex()], "limit": 1}), &format!("og-profile:{pubkey}"), Vec::new(), false).await.into_iter().next()?;
+    let ev = lookup(mirror, json!({"kinds": [0], "authors": [pubkey.to_hex()], "limit": 1}), &format!("og-profile:{pubkey}"), Vec::new(), None).await.into_iter().next()?;
     let v: Value = serde_json::from_str(&ev.content).ok()?;
     let text = |k: &str| v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
     Some(Profile { name: text("name"), about: text("about"), picture: text("picture") })
@@ -314,7 +355,7 @@ pub async fn tags_for(state: &State, config: &Config, mirror: &Mirror, path: &st
                 _ => return None,
             };
             let hints = hints.into_iter().take(og.hint_relays).collect();
-            let ev = lookup(mirror, filter, &format!("og-event:{key}"), hints, state.allow_private_hints).await.into_iter().next()?;
+            let ev = lookup(mirror, filter, &format!("og-event:{key}"), hints, Some(&state.hints)).await.into_iter().next()?;
             Some(event_tags(og, mirror, &ev, origin).await)
         }
         _ => None,
@@ -489,7 +530,7 @@ mod tests {
     #[tokio::test]
     async fn an_event_only_on_a_hinted_relay_is_found_when_hints_are_on() {
         let (_relay, path) = hinted_live_event().await;
-        let state = State { allow_private_hints: true, ..State::default() };
+        let state = State { hints: Arc::new(HintLimits { allow_private: true, ..HintLimits::default() }), ..State::default() };
         let t = tags_for(&state, &hint_config(3), &Mirror::new(0, None, &[]), &path, "https://example.com").await.unwrap();
         assert_eq!(meta(&t, "og:video"), Some("https://cdn/l.m3u8"));
     }
@@ -497,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn hints_are_ignored_by_default() {
         let (_relay, path) = hinted_live_event().await;
-        let state = State { allow_private_hints: true, ..State::default() };
+        let state = State { hints: Arc::new(HintLimits { allow_private: true, ..HintLimits::default() }), ..State::default() };
         assert!(tags_for(&state, &hint_config(0), &Mirror::new(0, None, &[]), &path, "https://example.com").await.is_none());
     }
 
@@ -513,7 +554,27 @@ mod tests {
         assert!(!hint_allowed(&url("ws://1.1.1.1"), false).await);
         assert!(!hint_allowed(&url("wss://127.0.0.1"), false).await);
         assert!(!hint_allowed(&url("wss://10.1.2.3:7777"), false).await);
+        assert!(!hint_allowed(&url("wss://1.1.1.1:8443"), false).await);
         assert!(hint_allowed(&url("wss://1.1.1.1"), false).await);
+    }
+
+    #[test]
+    fn a_hint_host_is_tried_once_per_interval_and_paused_after_a_failure() {
+        let limits = HintLimits::default();
+        let relay = RelayUrl::parse("wss://relay.example.com").unwrap();
+        assert!(limits.claim(&relay));
+        assert!(!limits.claim(&relay));
+        assert!(limits.claim(&RelayUrl::parse("wss://other.example.com").unwrap()));
+        limits.release(&relay, true);
+        assert!(limits.hosts.lock().unwrap()["relay.example.com"] > Instant::now() + HINT_HOST_INTERVAL);
+        assert_eq!(limits.in_flight.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn hints_beyond_the_concurrency_limit_are_skipped() {
+        let (_relay, path) = hinted_live_event().await;
+        let state = State { hints: Arc::new(HintLimits { allow_private: true, in_flight: AtomicUsize::new(HINT_CONCURRENCY), ..HintLimits::default() }), ..State::default() };
+        assert!(tags_for(&state, &hint_config(3), &Mirror::new(0, None, &[]), &path, "https://example.com").await.is_none());
     }
 
     #[tokio::test]
