@@ -28,6 +28,7 @@ pub struct Tags {
     pub title: Option<String>,
     pub canonical: Option<String>,
     pub json_ld: Option<String>,
+    pub author: Option<PublicKey>,
 }
 
 pub struct Profile {
@@ -116,6 +117,7 @@ pub fn profile_tags(og: &OpenGraph, pubkey: &PublicKey, profile: Option<&Profile
         title: Some(title).filter(|t| !t.is_empty()),
         canonical: None,
         json_ld,
+        ..Default::default()
     }
 }
 
@@ -148,7 +150,7 @@ fn live_tags(og: &OpenGraph, ev: &Event, host_profile: Option<&Profile>, host: &
         metas.push(pair("twitter:text:player_height", "480"));
     }
     let json_ld = json!({"@context": "https://schema.org", "@type": "BroadcastEvent", "name": title, "description": title, "streamURL": stream, "performer": {"@type": "Person", "name": host_name}}).to_string();
-    Tags { metas, title: Some(heading), canonical: None, json_ld: Some(json_ld) }
+    Tags { metas, title: Some(heading), canonical: None, json_ld: Some(json_ld), ..Default::default() }
 }
 
 fn clip_tags(og: &OpenGraph, ev: &Event, author: Option<&Profile>) -> Tags {
@@ -171,7 +173,7 @@ fn clip_tags(og: &OpenGraph, ev: &Event, author: Option<&Profile>) -> Tags {
         pair("twitter:image", &image),
     ];
     let json_ld = json!({"@context": "https://schema.org", "@type": "Clip", "name": title, "description": title, "video": {"@type": "VideoObject", "contentURL": stream}, "actor": {"@type": "Person", "name": name}}).to_string();
-    Tags { metas, title: Some(heading), canonical: None, json_ld: Some(json_ld) }
+    Tags { metas, title: Some(heading), canonical: None, json_ld: Some(json_ld), ..Default::default() }
 }
 
 fn iso_duration(secs: f64) -> String {
@@ -229,7 +231,7 @@ fn video_tags(og: &OpenGraph, ev: &Event, media: &Media, author: Option<&Profile
     if let Some(name) = author.and_then(|p| p.name.as_deref()) {
         ld["author"] = json!({"@type": "Person", "name": name});
     }
-    Tags { metas, title: Some(title), canonical: None, json_ld: Some(ld.to_string()) }
+    Tags { metas, title: Some(title), canonical: None, json_ld: Some(ld.to_string()), ..Default::default() }
 }
 
 fn picture_tags(og: &OpenGraph, ev: &Event, media: &Media, author: Option<&Profile>) -> Tags {
@@ -264,7 +266,7 @@ fn post_tags(og: &OpenGraph, ev: &Event, author: Option<&Profile>) -> Tags {
         pair("twitter:image", &image),
     ];
     let json_ld = json!({"@context": "https://schema.org", "@type": "Comment", "name": profile_name, "description": ev.content.replace('\n', " "), "datePublished": published, "author": {"@type": "Person", "name": profile_name}}).to_string();
-    Tags { metas, title: Some(heading), canonical: None, json_ld: Some(json_ld) }
+    Tags { metas, title: Some(heading), canonical: None, json_ld: Some(json_ld), ..Default::default() }
 }
 
 fn player_url(template: &str, ev: &Event, nip19: &str, requested: Option<&str>, origin: &str) -> String {
@@ -279,23 +281,26 @@ fn nip19(ev: &Event) -> Option<String> {
     }
 }
 
+fn stream_host(ev: &Event) -> PublicKey {
+    ev.tags
+        .iter()
+        .find(|t| {
+            let s = t.as_slice();
+            s.first().map(String::as_str) == Some("p") && s.len() > 3 && s[3].eq_ignore_ascii_case("host")
+        })
+        .and_then(|t| t.as_slice().get(1).and_then(|h| PublicKey::from_hex(h).ok()))
+        .unwrap_or(ev.pubkey)
+}
+
 pub async fn event_tags(og: &OpenGraph, mirror: &Mirror, ev: &Event, origin: &str, requested: Option<&str>) -> Tags {
     let link = og.links.iter().find(|l| l.kinds.contains(&ev.kind.as_u16()));
     let entity = nip19(ev);
     let player = link.and_then(|l| l.player.as_deref()).or(og.player.as_deref()).map(|t| player_url(t, ev, entity.as_deref().unwrap_or(""), requested, origin));
+    let author = if ev.kind.as_u16() == 30311 { stream_host(ev) } else { ev.pubkey };
     let mut tags = match ev.kind.as_u16() {
         30311 => {
-            let host = ev
-                .tags
-                .iter()
-                .find(|t| {
-                    let s = t.as_slice();
-                    s.first().map(String::as_str) == Some("p") && s.len() > 3 && s[3].eq_ignore_ascii_case("host")
-                })
-                .and_then(|t| t.as_slice().get(1).and_then(|h| PublicKey::from_hex(h).ok()))
-                .unwrap_or(ev.pubkey);
-            let p = profile(mirror, &host).await;
-            live_tags(og, ev, p.as_ref(), &host, player.as_deref())
+            let p = profile(mirror, &author).await;
+            live_tags(og, ev, p.as_ref(), &author, player.as_deref())
         }
         IMAGE_KIND | VIDEO_KIND | SHORTS_KIND | OLD_VIDEO_KIND | OLD_SHORTS_KIND => {
             let p = profile(mirror, &ev.pubkey).await;
@@ -316,6 +321,7 @@ pub async fn event_tags(og: &OpenGraph, mirror: &Mirror, ev: &Event, origin: &st
     };
     let path = link.map(|l| l.path.as_str()).unwrap_or("/{nip19}");
     tags.canonical = entity.map(|l| format!("{}{}", origin.trim_end_matches('/'), path.replace("{nip19}", &l)));
+    tags.author = Some(author);
     tags
 }
 
@@ -363,8 +369,8 @@ pub async fn tags_for(state: &State, config: &Config, mirror: &Mirror, path: &st
         Nip19::from_bech32(id).ok()?
     };
     let mut tags = match target {
-        Nip19::Pubkey(pk) => profile_tags(og, &pk, profile(mirror, &pk).await.as_ref()),
-        Nip19::Profile(p) => profile_tags(og, &p.public_key, profile(mirror, &p.public_key).await.as_ref()),
+        Nip19::Pubkey(pk) => Tags { author: Some(pk), ..profile_tags(og, &pk, profile(mirror, &pk).await.as_ref()) },
+        Nip19::Profile(p) => Tags { author: Some(p.public_key), ..profile_tags(og, &p.public_key, profile(mirror, &p.public_key).await.as_ref()) },
         Nip19::EventId(_) | Nip19::Event(_) | Nip19::Coordinate(_) => {
             let (filter, key) = match &target {
                 Nip19::EventId(i) => (json!({"ids": [i.to_hex()]}), i.to_hex()),
@@ -380,6 +386,31 @@ pub async fn tags_for(state: &State, config: &Config, mirror: &Mirror, path: &st
     let canonical = tags.canonical.get_or_insert_with(|| format!("{}{bare}", origin.trim_end_matches('/'))).clone();
     tags.metas.push(pair("og:url", &canonical));
     Some(tags)
+}
+
+pub async fn oembed(state: &State, config: &Config, mirror: &Mirror, url: &str, origin: &str) -> Option<Value> {
+    let settings = config.oembed.as_ref()?;
+    let path = url.strip_prefix(origin.trim_end_matches('/')).filter(|p| p.starts_with('/'))?;
+    let tags = tags_for(state, config, mirror, path, origin).await?;
+    let meta = |key: &str| tags.metas.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+    let mut doc = json!({"version": "1.0", "type": "link", "title": meta("og:title").unwrap_or(""), "provider_name": config.site_name, "provider_url": origin, "cache_age": 600});
+    if let Some(image) = meta("og:image") {
+        doc["thumbnail_url"] = json!(image);
+    }
+    if let Some(pk) = tags.author {
+        doc["author_url"] = json!(format!("{}{}", origin.trim_end_matches('/'), crate::media::profile_path(&pk)));
+        if let Some(name) = profile(mirror, &pk).await.and_then(|p| p.name) {
+            doc["author_name"] = json!(name);
+        }
+    }
+    if let Some(player) = meta("twitter:player") {
+        let (w, h) = (settings.width, settings.height);
+        doc["type"] = json!("video");
+        doc["html"] = json!(format!("<iframe src=\"{}\" width=\"{w}\" height=\"{h}\" frameborder=\"0\" allowfullscreen allow=\"autoplay; fullscreen\"></iframe>", escape_html(player)));
+        doc["width"] = json!(w);
+        doc["height"] = json!(h);
+    }
+    Some(doc)
 }
 
 fn strip(head: &str, pattern: &str) -> String {
@@ -556,6 +587,51 @@ mod tests {
         assert_eq!(meta(&t, "og:image"), Some("https://cdn/p.jpg"));
         assert_eq!(meta(&t, "twitter:image"), Some("https://cdn/p.jpg"));
         assert_eq!(meta(&t, "twitter:card"), Some("summary_large_image"));
+    }
+
+    fn oembed_config(og: OpenGraph) -> Config {
+        Config { site_name: "Demo".into(), opengraph: Some(og), oembed: Some(crate::config::Oembed::default()), ..Config::default() }
+    }
+
+    #[tokio::test]
+    async fn oembed_returns_a_video_iframe_for_a_page_with_a_player() {
+        let m = Mirror::new(0, None, &[]);
+        save(&m, &profile_event(1, r#"{"name":"erin"}"#)).await;
+        let ev = event(1, 21, "", vec![vec!["title", "Trip"], vec!["imeta", "url https://cdn/v.mp4", "m video/mp4", "dim 1920x1080", "image https://cdn/v.jpg"]]);
+        save(&m, &ev).await;
+        let nevent = Nip19Event::from(&ev).to_bech32().unwrap();
+        let doc = oembed(&State::default(), &oembed_config(player_og()), &m, &format!("https://example.com/{nevent}"), "https://example.com").await.unwrap();
+        assert_eq!(doc["type"], "video");
+        assert_eq!(doc["title"], "Trip");
+        assert_eq!(doc["author_name"], "erin");
+        assert!(doc["author_url"].as_str().unwrap().starts_with("https://example.com/p/nprofile1"));
+        assert_eq!(doc["thumbnail_url"], "https://cdn/v.jpg");
+        assert_eq!(doc["provider_name"], "Demo");
+        assert_eq!((doc["width"].as_u64(), doc["height"].as_u64()), (Some(640), Some(360)));
+        assert!(doc["html"].as_str().unwrap().starts_with(&format!("<iframe src=\"https://example.com/embed?v={nevent}\" width=\"640\" height=\"360\"")));
+    }
+
+    #[tokio::test]
+    async fn oembed_returns_a_link_for_tagged_pages_without_a_player() {
+        let m = Mirror::new(0, None, &[]);
+        save(&m, &profile_event(3, r#"{"name":"dave"}"#)).await;
+        let npub = keys(3).public_key().to_bech32().unwrap();
+        let doc = oembed(&State::default(), &oembed_config(player_og()), &m, &format!("https://example.com/{npub}"), "https://example.com").await.unwrap();
+        assert_eq!(doc["type"], "link");
+        assert_eq!(doc["title"], "dave's Profile");
+        assert!(doc.get("html").is_none());
+    }
+
+    #[tokio::test]
+    async fn oembed_rejects_foreign_and_untagged_urls() {
+        let m = Mirror::new(0, None, &[]);
+        save(&m, &profile_event(3, r#"{"name":"dave"}"#)).await;
+        let npub = keys(3).public_key().to_bech32().unwrap();
+        let config = oembed_config(player_og());
+        assert!(oembed(&State::default(), &config, &m, &format!("https://other.example/{npub}"), "https://example.com").await.is_none());
+        assert!(oembed(&State::default(), &config, &m, &format!("https://example.com.other.example/{npub}"), "https://example.com").await.is_none());
+        assert!(oembed(&State::default(), &config, &m, "https://example.com/streams", "https://example.com").await.is_none());
+        assert!(oembed(&State::default(), &Config { oembed: None, ..config }, &m, &format!("https://example.com/{npub}"), "https://example.com").await.is_none());
     }
 
     #[tokio::test]
@@ -775,7 +851,7 @@ mod tests {
     #[test]
     fn merging_replaces_matching_head_tags_once_and_keeps_the_rest_escaped() {
         let head = "<title>Home - zap.stream</title>\n    <meta property=\"og:title\" content=\"old\" />\n    <meta name=\"description\" content=\"keep\" />\n    <link rel=\"canonical\" href=\"https://zap.stream\" />";
-        let tags = Tags { metas: vec![pair("og:title", "A & B \"q\"")], title: Some("A & B".into()), canonical: Some("https://zap.stream/naddr1x".into()), json_ld: Some("{\"a\":\"</script>\"}".into()) };
+        let tags = Tags { metas: vec![pair("og:title", "A & B \"q\"")], title: Some("A & B".into()), canonical: Some("https://zap.stream/naddr1x".into()), json_ld: Some("{\"a\":\"</script>\"}".into()), ..Default::default() };
         let out = merge(head, &tags);
         assert_eq!(out.matches("og:title").count(), 1);
         assert_eq!(out.matches("<title>").count(), 1);

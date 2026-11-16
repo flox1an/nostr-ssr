@@ -91,6 +91,20 @@ impl Default for OpenGraph {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct Oembed {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for Oembed {
+    fn default() -> Self {
+        Oembed { path: "/oembed".into(), width: 640, height: 360 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Health {
     pub filter: Value,
     pub interval_secs: u64,
@@ -158,6 +172,7 @@ pub struct Config {
     pub health: Option<Health>,
     pub proxy: Vec<ProxyRule>,
     pub opengraph: Option<OpenGraph>,
+    pub oembed: Option<Oembed>,
     pub headers: Vec<HeaderRule>,
     pub shells: Vec<ShellRule>,
     pub static_paths: Vec<String>,
@@ -188,6 +203,7 @@ impl Default for Config {
             health: None,
             proxy: vec![],
             opengraph: None,
+            oembed: None,
             headers: vec![],
             shells: vec![],
             static_paths: vec!["/".into()],

@@ -5,7 +5,7 @@ use crate::sitemap::Sitemaps;
 use crate::engine::Renderer;
 use crate::head::{assemble, assemble_raw, head_tags, Head, Site};
 use crate::mirror::{parse_filter, Mirror};
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -61,11 +61,29 @@ pub fn router(app: Shared) -> Router {
         .route("/sitemap-{file}", get(crate::sitemap::file))
         .nest_service("/assets", ServeDir::new(app.config.client_dir().join("assets")));
     let base = for_plugin_routes(base, &app.plugins);
+    let base = match &app.config.oembed {
+        Some(o) => base.route(&o.path, get(oembed)),
+        None => base,
+    };
     base.fallback_service(assets.fallback(get(page).with_state(app.clone())))
         .layer(axum::middleware::from_fn_with_state(app.clone(), custom_headers))
         .layer(axum::middleware::map_response(cache_assets))
         .layer(CompressionLayer::new())
         .with_state(app)
+}
+
+async fn oembed(State(app): State<Shared>, headers: HeaderMap, Query(query): Query<std::collections::HashMap<String, String>>) -> Response {
+    if query.get("format").is_some_and(|f| f != "json") {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
+    let Some(url) = query.get("url") else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let origin = origin(&app, &headers);
+    match crate::opengraph::oembed(&app.opengraph, &app.config, &app.mirror, url, &origin).await {
+        Some(doc) => ([(header::CACHE_CONTROL, "public, max-age=600")], axum::Json(doc)).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 fn for_plugin_routes(mut base: Router<Shared>, plugins: &[Arc<dyn Plugin>]) -> Router<Shared> {
@@ -430,6 +448,20 @@ globalThis.ssrPaths = () => JSON.stringify(["/about"]);
         note(&app, 2, 11, "second").await;
         assert!(!get_page(&app, "/").await.1.contains("second"));
         assert!(get_page(&app, "/?fresh=1").await.1.contains("second"));
+    }
+
+    #[tokio::test]
+    async fn the_oembed_route_checks_its_query_and_is_off_by_default() {
+        let mut app = setup("oembed", BUNDLE);
+        assert_eq!(router(app.clone()).oneshot(Request::get("/oembed").body(Body::empty()).unwrap()).await.unwrap().headers()[header::CONTENT_TYPE], "text/html; charset=utf-8");
+        Arc::get_mut(&mut app).unwrap().config.oembed = Some(crate::config::Oembed::default());
+        let status = |uri: &'static str| {
+            let app = app.clone();
+            async move { router(app).oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap().status() }
+        };
+        assert_eq!(status("/oembed").await, StatusCode::BAD_REQUEST);
+        assert_eq!(status("/oembed?url=https%3A%2F%2Ft.example%2Fx&format=xml").await, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(status("/oembed?url=https%3A%2F%2Ft.example%2Fnothing").await, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
