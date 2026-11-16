@@ -59,6 +59,7 @@ pub struct OpenGraph {
     pub nip05_headers: std::collections::HashMap<String, String>,
     pub nip05_domain: Option<String>,
     pub skip_paths: Vec<String>,
+    pub hint_relays: usize,
 }
 
 impl Default for OpenGraph {
@@ -71,6 +72,7 @@ impl Default for OpenGraph {
             nip05_headers: Default::default(),
             nip05_domain: None,
             skip_paths: vec![],
+            hint_relays: 0,
         }
     }
 }
