@@ -196,6 +196,13 @@ fn post_tags(og: &OpenGraph, ev: &Event, author: Option<&Profile>) -> Tags {
     Tags { metas, title: Some(heading), canonical: None, json_ld: Some(json_ld) }
 }
 
+fn nip19(ev: &Event) -> Option<String> {
+    match ev.coordinate() {
+        Some(c) => Nip19Coordinate::new(c, Vec::<RelayUrl>::new()).to_bech32().ok(),
+        None => Nip19Event::from(ev).to_bech32().ok(),
+    }
+}
+
 pub async fn event_tags(og: &OpenGraph, mirror: &Mirror, ev: &Event, origin: &str) -> Tags {
     let mut tags = match ev.kind.as_u16() {
         30311 => {
@@ -220,11 +227,8 @@ pub async fn event_tags(og: &OpenGraph, mirror: &Mirror, ev: &Event, origin: &st
             post_tags(og, ev, p.as_ref())
         }
     };
-    let link = match ev.coordinate() {
-        Some(c) => Nip19Coordinate::new(c, Vec::<RelayUrl>::new()).to_bech32().ok(),
-        None => Nip19Event::from(ev).to_bech32().ok(),
-    };
-    tags.canonical = link.map(|l| format!("{}/{l}", origin.trim_end_matches('/')));
+    let path = og.links.iter().find(|l| l.kinds.contains(&ev.kind.as_u16())).map(|l| l.path.as_str()).unwrap_or("/{nip19}");
+    tags.canonical = nip19(ev).map(|l| format!("{}{}", origin.trim_end_matches('/'), path.replace("{nip19}", &l)));
     tags
 }
 
@@ -412,6 +416,16 @@ mod tests {
         assert_eq!(meta(&t, "og:image"), Some("https://x/c.png"));
         assert_eq!(meta(&t, "og:article:author:username"), Some("carol"));
         assert!(meta(&t, "og:article:published_time").unwrap().starts_with("2023-11-14T"));
+    }
+
+    #[tokio::test]
+    async fn a_kind_link_sets_the_canonical_path() {
+        let m = Mirror::new(0, None, &[]);
+        let o = OpenGraph { links: vec![crate::config::Link { kinds: vec![30311], path: "/live/{nip19}".into() }], ..og() };
+        let live = event(1, 30311, "", vec![vec!["d", "room"]]);
+        assert!(event_tags(&o, &m, &live, "https://example.com").await.canonical.unwrap().starts_with("https://example.com/live/naddr1"));
+        let note = event(1, 1, "hi", vec![]);
+        assert!(event_tags(&o, &m, &note, "https://example.com").await.canonical.unwrap().starts_with("https://example.com/nevent1"));
     }
 
     #[tokio::test]

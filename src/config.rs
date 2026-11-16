@@ -49,6 +49,13 @@ pub struct HeaderRule {
     pub set: std::collections::HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Link {
+    pub kinds: Vec<u16>,
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct OpenGraph {
@@ -61,6 +68,7 @@ pub struct OpenGraph {
     pub skip_paths: Vec<String>,
     pub entity_prefixes: Vec<String>,
     pub addresses: bool,
+    pub links: Vec<Link>,
 }
 
 impl Default for OpenGraph {
@@ -75,6 +83,7 @@ impl Default for OpenGraph {
             skip_paths: vec![],
             entity_prefixes: vec!["/".into(), "/e/".into(), "/p/".into()],
             addresses: true,
+            links: vec![],
         }
     }
 }
