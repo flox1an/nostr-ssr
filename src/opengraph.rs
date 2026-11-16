@@ -1,5 +1,5 @@
 use crate::config::{Config, OpenGraph};
-use crate::head::escape_html;
+use crate::head::{absolute, escape_html};
 use crate::mirror::{parse_filter, Mirror};
 use nostr::nips::nip19::{Nip19, Nip19Coordinate, Nip19Event};
 use nostr::prelude::*;
@@ -118,7 +118,7 @@ pub fn profile_tags(og: &OpenGraph, pubkey: &PublicKey, profile: Option<&Profile
     }
 }
 
-fn live_tags(og: &OpenGraph, ev: &Event, host_profile: Option<&Profile>, host: &PublicKey) -> Tags {
+fn live_tags(og: &OpenGraph, ev: &Event, host_profile: Option<&Profile>, host: &PublicKey, player: Option<&str>) -> Tags {
     let host_name = host_profile.and_then(|p| p.name.as_deref()).unwrap_or("Nostrich");
     let stream = tag_value(ev, "streaming").or_else(|| tag_value(ev, "recording")).unwrap_or("");
     let image = tag_value(ev, "image").map(str::to_string).or_else(|| host_profile.and_then(|p| p.picture.clone())).unwrap_or_else(|| avatar(og, host));
@@ -140,9 +140,8 @@ fn live_tags(og: &OpenGraph, ev: &Event, host_profile: Option<&Profile>, host: &
     if let Some(site) = &og.twitter_site {
         metas.push(pair("twitter:site", site));
     }
-    if let Some(player) = &og.player {
-        let nevent = Nip19Event::new(ev.id).author(ev.pubkey).kind(ev.kind).to_bech32().unwrap_or_default();
-        metas.push(pair("twitter:player", &player.replace("{nevent}", &nevent)));
+    if let Some(player) = player {
+        metas.push(pair("twitter:player", player));
         metas.push(pair("twitter:player:width", "640"));
         metas.push(pair("twitter:player:height", "480"));
         metas.push(pair("twitter:text:player_height", "480"));
@@ -196,6 +195,11 @@ fn post_tags(og: &OpenGraph, ev: &Event, author: Option<&Profile>) -> Tags {
     Tags { metas, title: Some(heading), canonical: None, json_ld: Some(json_ld) }
 }
 
+fn player_url(template: &str, ev: &Event, nip19: &str, requested: Option<&str>, origin: &str) -> String {
+    let nevent = Nip19Event::new(ev.id).author(ev.pubkey).kind(ev.kind).to_bech32().unwrap_or_default();
+    absolute(origin, &template.replace("{nevent}", &nevent).replace("{nip19}", nip19).replace("{id}", requested.unwrap_or(nip19)))
+}
+
 fn nip19(ev: &Event) -> Option<String> {
     match ev.coordinate() {
         Some(c) => Nip19Coordinate::new(c, Vec::<RelayUrl>::new()).to_bech32().ok(),
@@ -203,7 +207,10 @@ fn nip19(ev: &Event) -> Option<String> {
     }
 }
 
-pub async fn event_tags(og: &OpenGraph, mirror: &Mirror, ev: &Event, origin: &str) -> Tags {
+pub async fn event_tags(og: &OpenGraph, mirror: &Mirror, ev: &Event, origin: &str, requested: Option<&str>) -> Tags {
+    let link = og.links.iter().find(|l| l.kinds.contains(&ev.kind.as_u16()));
+    let entity = nip19(ev);
+    let player = link.and_then(|l| l.player.as_deref()).or(og.player.as_deref()).map(|t| player_url(t, ev, entity.as_deref().unwrap_or(""), requested, origin));
     let mut tags = match ev.kind.as_u16() {
         30311 => {
             let host = ev
@@ -216,7 +223,7 @@ pub async fn event_tags(og: &OpenGraph, mirror: &Mirror, ev: &Event, origin: &st
                 .and_then(|t| t.as_slice().get(1).and_then(|h| PublicKey::from_hex(h).ok()))
                 .unwrap_or(ev.pubkey);
             let p = profile(mirror, &host).await;
-            live_tags(og, ev, p.as_ref(), &host)
+            live_tags(og, ev, p.as_ref(), &host, player.as_deref())
         }
         1313 => {
             let p = profile(mirror, &ev.pubkey).await;
@@ -227,8 +234,8 @@ pub async fn event_tags(og: &OpenGraph, mirror: &Mirror, ev: &Event, origin: &st
             post_tags(og, ev, p.as_ref())
         }
     };
-    let path = og.links.iter().find(|l| l.kinds.contains(&ev.kind.as_u16())).map(|l| l.path.as_str()).unwrap_or("/{nip19}");
-    tags.canonical = nip19(ev).map(|l| format!("{}{}", origin.trim_end_matches('/'), path.replace("{nip19}", &l)));
+    let path = link.map(|l| l.path.as_str()).unwrap_or("/{nip19}");
+    tags.canonical = entity.map(|l| format!("{}{}", origin.trim_end_matches('/'), path.replace("{nip19}", &l)));
     tags
 }
 
@@ -286,7 +293,7 @@ pub async fn tags_for(state: &State, config: &Config, mirror: &Mirror, path: &st
                 _ => return None,
             };
             let ev = lookup(mirror, filter, &format!("og-event:{key}")).await.into_iter().next()?;
-            event_tags(og, mirror, &ev, origin).await
+            event_tags(og, mirror, &ev, origin, Some(id)).await
         }
         _ => return None,
     };
@@ -365,7 +372,7 @@ mod tests {
         let host = keys(2);
         save(&m, &profile_event(2, r#"{"name":"alice","picture":"https://x/a.png"}"#)).await;
         let ev = event(1, 30311, "", vec![vec!["d", "room"], vec!["title", "Late show"], vec!["streaming", "https://cdn/live.m3u8"], vec!["image", "https://x/cover.png"], vec!["p", &host.public_key().to_hex(), "", "Host"]]);
-        let t = event_tags(&og(), &m, &ev, "https://zap.stream").await;
+        let t = event_tags(&og(), &m, &ev, "https://zap.stream", None).await;
         assert_eq!(meta(&t, "og:type"), Some("video.other"));
         assert_eq!(meta(&t, "og:title"), Some("alice is streaming"));
         assert_eq!(meta(&t, "og:description"), Some("Late show"));
@@ -385,7 +392,7 @@ mod tests {
     async fn an_ended_stream_falls_back_to_the_recording_and_the_host_avatar_when_there_is_no_image() {
         let m = Mirror::new(0, None, &[]);
         let ev = event(1, 30311, "", vec![vec!["d", "room"], vec!["recording", "https://cdn/rec.m3u8"]]);
-        let t = event_tags(&og(), &m, &ev, "https://zap.stream").await;
+        let t = event_tags(&og(), &m, &ev, "https://zap.stream", None).await;
         assert_eq!(meta(&t, "og:video"), Some("https://cdn/rec.m3u8"));
         assert_eq!(meta(&t, "og:title"), Some("Nostrich is streaming"));
         assert!(meta(&t, "og:image").unwrap().contains(&keys(1).public_key().to_hex()));
@@ -396,7 +403,7 @@ mod tests {
         let m = Mirror::new(0, None, &[]);
         save(&m, &profile_event(1, r#"{"name":"bob"}"#)).await;
         let ev = event(1, 1313, "", vec![vec!["r", "https://cdn/clip.mp4"], vec!["title", "Big moment"]]);
-        let t = event_tags(&og(), &m, &ev, "https://zap.stream").await;
+        let t = event_tags(&og(), &m, &ev, "https://zap.stream", None).await;
         assert_eq!(meta(&t, "og:title"), Some("bob created a clip"));
         assert_eq!(meta(&t, "og:video"), Some("https://cdn/clip.mp4"));
         assert_eq!(meta(&t, "og:video:type"), Some("video/mp4"));
@@ -410,7 +417,7 @@ mod tests {
         let m = Mirror::new(0, None, &[]);
         save(&m, &profile_event(1, r#"{"name":"carol","picture":"https://x/c.png"}"#)).await;
         let ev = event(1, 1, &"x".repeat(300), vec![]);
-        let t = event_tags(&og(), &m, &ev, "https://zap.stream").await;
+        let t = event_tags(&og(), &m, &ev, "https://zap.stream", None).await;
         assert_eq!(meta(&t, "og:type"), Some("article"));
         assert_eq!(meta(&t, "og:title").unwrap().chars().count(), "carol: ".len() + 160);
         assert_eq!(meta(&t, "og:image"), Some("https://x/c.png"));
@@ -421,11 +428,41 @@ mod tests {
     #[tokio::test]
     async fn a_kind_link_sets_the_canonical_path() {
         let m = Mirror::new(0, None, &[]);
-        let o = OpenGraph { links: vec![crate::config::Link { kinds: vec![30311], path: "/live/{nip19}".into() }], ..og() };
+        let o = OpenGraph { links: vec![crate::config::Link { kinds: vec![30311], path: "/live/{nip19}".into(), player: None }], ..og() };
         let live = event(1, 30311, "", vec![vec!["d", "room"]]);
-        assert!(event_tags(&o, &m, &live, "https://example.com").await.canonical.unwrap().starts_with("https://example.com/live/naddr1"));
+        assert!(event_tags(&o, &m, &live, "https://example.com", None).await.canonical.unwrap().starts_with("https://example.com/live/naddr1"));
         let note = event(1, 1, "hi", vec![]);
-        assert!(event_tags(&o, &m, &note, "https://example.com").await.canonical.unwrap().starts_with("https://example.com/nevent1"));
+        assert!(event_tags(&o, &m, &note, "https://example.com", None).await.canonical.unwrap().starts_with("https://example.com/nevent1"));
+    }
+
+    #[tokio::test]
+    async fn a_link_player_overrides_the_site_player() {
+        let m = Mirror::new(0, None, &[]);
+        let o = OpenGraph { links: vec![crate::config::Link { kinds: vec![30311], path: "/live/{nip19}".into(), player: Some("https://example.com/watch/{nip19}".into()) }], ..og() };
+        let live = event(1, 30311, "", vec![vec!["d", "room"]]);
+        let t = event_tags(&o, &m, &live, "https://example.com", None).await;
+        assert!(meta(&t, "twitter:player").unwrap().starts_with("https://example.com/watch/naddr1"));
+    }
+
+    #[tokio::test]
+    async fn a_relative_player_becomes_absolute() {
+        let m = Mirror::new(0, None, &[]);
+        let o = OpenGraph { player: Some("/embed?e={nevent}".into()), ..og() };
+        let live = event(1, 30311, "", vec![vec!["d", "room"]]);
+        let t = event_tags(&o, &m, &live, "https://example.com", None).await;
+        assert!(meta(&t, "twitter:player").unwrap().starts_with("https://example.com/embed?e=nevent1"));
+    }
+
+    #[tokio::test]
+    async fn the_id_placeholder_keeps_the_requested_identifier() {
+        let m = Mirror::new(0, None, &[]);
+        let live = event(1, 30311, "", vec![vec!["d", "room"]]);
+        save(&m, &live).await;
+        let state = State::default();
+        let config = Config { opengraph: Some(OpenGraph { player: Some("/embed?v={id}".into()), ..og() }), ..Config::default() };
+        let hinted = Nip19Event::new(live.id).relays([RelayUrl::parse("wss://relay.example.com").unwrap()]).to_bech32().unwrap();
+        let t = tags_for(&state, &config, &m, &format!("/e/{hinted}"), "https://example.com").await.unwrap();
+        assert_eq!(meta(&t, "twitter:player"), Some(format!("https://example.com/embed?v={hinted}").as_str()));
     }
 
     #[tokio::test]

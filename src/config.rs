@@ -54,6 +54,7 @@ pub struct HeaderRule {
 pub struct Link {
     pub kinds: Vec<u16>,
     pub path: String,
+    pub player: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
