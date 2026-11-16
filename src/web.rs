@@ -58,7 +58,8 @@ pub fn router(app: Shared) -> Router {
     let base = crate::proxy::routes(&app.config.proxy)
         .route("/sitemap.xml", get(crate::sitemap::index))
         .route("/sitemap-pages.xml", get(crate::sitemap::pages))
-        .route("/sitemap-{file}", get(crate::sitemap::file));
+        .route("/sitemap-{file}", get(crate::sitemap::file))
+        .nest_service("/assets", ServeDir::new(app.config.client_dir().join("assets")));
     let base = for_plugin_routes(base, &app.plugins);
     base.fallback_service(assets.fallback(get(page).with_state(app.clone())))
         .layer(axum::middleware::from_fn_with_state(app.clone(), custom_headers))
@@ -409,6 +410,15 @@ globalThis.ssrPaths = () => JSON.stringify(["/about"]);
         let app = setup("assets", BUNDLE);
         let res = router(app.clone()).oneshot(Request::get("/assets/a.js").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.headers()[header::CACHE_CONTROL], "public, max-age=31536000, immutable");
+    }
+
+    #[tokio::test]
+    async fn a_missing_asset_is_404_and_not_cached_immutably() {
+        let app = setup("missing-asset", BUNDLE);
+        let res = router(app.clone()).oneshot(Request::get("/assets/gone.js").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(res.headers().get(header::CACHE_CONTROL).is_none());
+        assert!(!String::from_utf8(to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap().contains("<html>"));
     }
 
     #[tokio::test]
