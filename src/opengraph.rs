@@ -1,6 +1,6 @@
 use crate::config::{Config, OpenGraph};
 use crate::head::{absolute, escape_html};
-use crate::media::{Media, OLD_SHORTS_KIND, OLD_VIDEO_KIND, SHORTS_KIND, VIDEO_KIND};
+use crate::media::{Media, IMAGE_KIND, OLD_SHORTS_KIND, OLD_VIDEO_KIND, SHORTS_KIND, VIDEO_KIND};
 use crate::mirror::{parse_filter, Mirror};
 use nostr::nips::nip19::{Nip19, Nip19Coordinate, Nip19Event};
 use nostr::prelude::*;
@@ -232,6 +232,18 @@ fn video_tags(og: &OpenGraph, ev: &Event, media: &Media, author: Option<&Profile
     Tags { metas, title: Some(title), canonical: None, json_ld: Some(ld.to_string()) }
 }
 
+fn picture_tags(og: &OpenGraph, ev: &Event, media: &Media, author: Option<&Profile>) -> Tags {
+    let mut tags = post_tags(og, ev, author);
+    for (key, value) in tags.metas.iter_mut() {
+        match key.as_str() {
+            "og:image" | "twitter:image" => *value = media.url.clone(),
+            "twitter:card" => *value = "summary_large_image".into(),
+            _ => {}
+        }
+    }
+    tags
+}
+
 fn post_tags(og: &OpenGraph, ev: &Event, author: Option<&Profile>) -> Tags {
     let name = author.and_then(|p| p.name.as_deref()).unwrap_or("Nostrich");
     let heading = format!("{name}: {}", clip(&ev.content, 160));
@@ -284,9 +296,10 @@ pub async fn event_tags(og: &OpenGraph, mirror: &Mirror, ev: &Event, origin: &st
             let p = profile(mirror, &host).await;
             live_tags(og, ev, p.as_ref(), &host, player.as_deref())
         }
-        VIDEO_KIND | SHORTS_KIND | OLD_VIDEO_KIND | OLD_SHORTS_KIND => {
+        IMAGE_KIND | VIDEO_KIND | SHORTS_KIND | OLD_VIDEO_KIND | OLD_SHORTS_KIND => {
             let p = profile(mirror, &ev.pubkey).await;
             match crate::media::parse(ev) {
+                Some(media) if media.is_image() => picture_tags(og, ev, &media, p.as_ref()),
                 Some(media) => video_tags(og, ev, &media, p.as_ref(), player.as_deref()),
                 None => post_tags(og, ev, p.as_ref()),
             }
@@ -522,6 +535,16 @@ mod tests {
         assert!(ld["uploadDate"].as_str().unwrap().starts_with("2023-11-14T"));
         assert_eq!(ld["contentUrl"], "https://cdn/v.mp4");
         assert!(ld["embedUrl"].as_str().unwrap().starts_with("https://example.com/embed?v="));
+    }
+
+    #[tokio::test]
+    async fn a_picture_post_is_tagged_with_its_picture() {
+        let m = Mirror::new(0, None, &[]);
+        let ev = event(1, 20, "sunset", vec![vec!["imeta", "url https://cdn/p.jpg", "m image/jpeg"]]);
+        let t = event_tags(&OpenGraph::default(), &m, &ev, "https://example.com", None).await;
+        assert_eq!(meta(&t, "og:image"), Some("https://cdn/p.jpg"));
+        assert_eq!(meta(&t, "twitter:image"), Some("https://cdn/p.jpg"));
+        assert_eq!(meta(&t, "twitter:card"), Some("summary_large_image"));
     }
 
     #[tokio::test]
